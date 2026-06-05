@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     app_name: str = "Beacon AI API"
 
     database_url: str = (
-        "postgresql+psycopg://beacon:beacon_password@localhost:5432/beacon_db"
+        "postgresql+psycopg://beacon:beacon_password@localhost:5433/beacon_db"
     )
 
     redis_url: str = "redis://localhost:6379/0"
