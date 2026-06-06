@@ -17,6 +17,8 @@ h11==0.16.0
 httptools==0.8.0
 idna==3.18
 kombu==5.6.2
+numpy==2.2.6
+opencv-python==4.13.0.92
 packaging==26.2
 pillow==12.2.0
 prompt_toolkit==3.0.52

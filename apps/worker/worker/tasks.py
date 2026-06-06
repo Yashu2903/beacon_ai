@@ -47,7 +47,8 @@ def ingest_manual(job_id: str):
                 "Source evidence extraction complete. "
                 f"pages={result.page_count}, "
                 f"text_spans={result.text_span_count}, "
-                f"images={result.image_count}, "
+                f"embedded_images={result.embedded_image_count}, "
+                f"diagram_regions={result.diagram_region_count}, "
                 f"scanned_flag={result.scanned_flag}"
             ),
         )
