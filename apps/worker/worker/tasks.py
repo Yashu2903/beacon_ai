@@ -1,9 +1,10 @@
-import time
 import uuid
 
 from app.core.database import SessionLocal
 from app.models.enums import JobState
+from app.models.job import Job
 from app.services.job_state import transition_job_state
+from app.services.pdf_ingest import ingest_pdf_document
 from worker.celery_app import celery_app
 
 
@@ -19,27 +20,47 @@ def ingest_manual(job_id: str):
             job_id=parsed_job_id,
             to_state=JobState.INGESTING,
             actor_type="worker",
-            message="Skeleton ingest started.",
+            message="PDF ingest started.",
         )
 
-        # Phase 1 placeholder.
-        # In Phase 2, this becomes:
-        # - PDF parsing
-        # - page image rendering
-        # - diagram extraction
-        # - OCR fallback
-        # - source evidence creation
-        time.sleep(2)
+        job = db.get(Job, parsed_job_id)
+
+        if job is None:
+            raise ValueError(f"Job not found: {parsed_job_id}")
 
         transition_job_state(
             db,
             job_id=parsed_job_id,
             to_state=JobState.EXTRACTING_EVIDENCE,
             actor_type="worker",
-            message="Skeleton ingest complete. Ready for Phase 2 evidence extraction.",
+            message="Starting source evidence extraction.",
+        )
+
+        result = ingest_pdf_document(db, job.document_id)
+
+        transition_job_state(
+            db,
+            job_id=parsed_job_id,
+            to_state=JobState.EXTRACTING_STEPS,
+            actor_type="worker",
+            message=(
+                "Source evidence extraction complete. "
+                f"pages={result.page_count}, "
+                f"text_spans={result.text_span_count}, "
+                f"images={result.image_count}, "
+                f"scanned_flag={result.scanned_flag}"
+            ),
         )
 
     except Exception as exc:
+        db.rollback()
+
+        job = db.get(Job, parsed_job_id)
+
+        if job:
+            job.failure_reason = str(exc)
+            db.commit()
+
         try:
             transition_job_state(
                 db,

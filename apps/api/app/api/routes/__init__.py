@@ -1,4 +1,3 @@
-from app.api.routes import jobs, upload
+from app.api.routes import evidence, jobs, upload
 
-__all__ = ["jobs", "upload"]
-
+__all__ = ["evidence", "jobs", "upload"]

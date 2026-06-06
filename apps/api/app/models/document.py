@@ -29,3 +29,5 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     jobs = relationship("Job", back_populates="document")
+    pages = relationship("DocumentPage", back_populates="document")
+    source_evidence = relationship("SourceEvidence", back_populates="document")
