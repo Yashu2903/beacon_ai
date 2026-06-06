@@ -7,9 +7,23 @@ from app.core.database import get_db
 from app.models.document import Document
 from app.models.document_page import DocumentPage
 from app.models.source_evidence import SourceEvidence
+from app.schemas.document import DocumentResponse
 from app.schemas.evidence import DocumentPageResponse, SourceEvidenceResponse
 
 router = APIRouter(prefix="/documents", tags=["evidence"])
+
+
+@router.get("/{document_id}", response_model=DocumentResponse)
+def get_document(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return document
 
 
 @router.get("/{document_id}/pages", response_model=list[DocumentPageResponse])

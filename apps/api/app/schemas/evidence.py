@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, computed_field
 
 
 class DocumentPageResponse(BaseModel):
@@ -14,6 +14,13 @@ class DocumentPageResponse(BaseModel):
     page_image_key: str | None
     text_extraction_status: str
     created_at: datetime
+
+    @computed_field
+    @property
+    def page_image_url(self) -> str | None:
+        if not self.page_image_key:
+            return None
+        return f"/storage/{self.page_image_key}"
 
     class Config:
         from_attributes = True
@@ -38,6 +45,13 @@ class SourceEvidenceResponse(BaseModel):
     validation_flag: str | None
     metadata_json: dict | None
     created_at: datetime
+
+    @computed_field
+    @property
+    def storage_url(self) -> str | None:
+        if not self.storage_key:
+            return None
+        return f"/storage/{self.storage_key}"
 
     class Config:
         from_attributes = True
