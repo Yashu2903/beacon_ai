@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import audit_logs, evidence, jobs, upload
+from app.api.routes import audit_logs, evidence, jobs, steps, upload
 from app.core.config import settings
 
 
@@ -26,3 +26,4 @@ app.include_router(upload.router)
 app.include_router(jobs.router)
 app.include_router(evidence.router)
 app.include_router(audit_logs.router)
+app.include_router(steps.router)
