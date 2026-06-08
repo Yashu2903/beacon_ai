@@ -15,8 +15,11 @@ class Settings(BaseSettings):
     demo_tenant_id: str = "demo"
     demo_user_email: str = "demo@beacon.local"
 
+    tesseract_cmd: str | None = None
+
     class Config:
         env_file = ".env"
+        extra = "ignore"
 
 
 settings = Settings()

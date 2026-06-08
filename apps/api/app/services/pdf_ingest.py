@@ -4,14 +4,18 @@ import uuid
 from dataclasses import dataclass
 from decimal import Decimal
 
-import cv2
 import fitz
-import numpy as np
 from sqlalchemy.orm import Session
 
 from app.models.document import Document
 from app.models.document_page import DocumentPage
 from app.models.source_evidence import SourceEvidence
+from app.services.diagram_extraction import (
+    DiagramExtractionResult,
+    DiagramRegion,
+    OpenCVExtractor,
+    PageExtractionInput,
+)
 from app.services.storage import storage_service
 
 
@@ -197,202 +201,76 @@ def _extract_embedded_images(
     return embedded_image_count
 
 
-def _is_probable_diagram_region(
-    *,
-    x: int,
-    y: int,
-    w: int,
-    h: int,
-    page_width_px: int,
-    page_height_px: int,
-) -> bool:
-    area = w * h
-    page_area = page_width_px * page_height_px
-
-    if area < page_area * 0.015:
-        return False
-
-    if area > page_area * 0.80:
-        return False
-
-    if w < 120 or h < 80:
-        return False
-
-    aspect_ratio = w / max(h, 1)
-
-    if aspect_ratio < 0.25 or aspect_ratio > 6.0:
-        return False
-
-    return True
-
-
-def _merge_overlapping_boxes(
-    boxes: list[tuple[int, int, int, int]],
-    iou_threshold: float = 0.15,
-) -> list[tuple[int, int, int, int]]:
-    def iou(box_a, box_b) -> float:
-        ax, ay, aw, ah = box_a
-        bx, by, bw, bh = box_b
-
-        ax2, ay2 = ax + aw, ay + ah
-        bx2, by2 = bx + bw, by + bh
-
-        inter_x1 = max(ax, bx)
-        inter_y1 = max(ay, by)
-        inter_x2 = min(ax2, bx2)
-        inter_y2 = min(ay2, by2)
-
-        inter_w = max(0, inter_x2 - inter_x1)
-        inter_h = max(0, inter_y2 - inter_y1)
-        inter_area = inter_w * inter_h
-
-        area_a = aw * ah
-        area_b = bw * bh
-
-        union_area = area_a + area_b - inter_area
-
-        if union_area == 0:
-            return 0.0
-
-        return inter_area / union_area
-
-    merged: list[tuple[int, int, int, int]] = []
-
-    for box in sorted(boxes, key=lambda b: b[2] * b[3], reverse=True):
-        should_add = True
-
-        for existing in merged:
-            if iou(box, existing) > iou_threshold:
-                should_add = False
-                break
-
-        if should_add:
-            merged.append(box)
-
-    return merged
-
-
-def _detect_and_crop_diagram_regions(
+def _create_diagram_region_evidence(
     *,
     db: Session,
     document: Document,
     document_page: DocumentPage,
-    page_number: int,
-    page_png_bytes: bytes,
-    pdf_page_width: float,
-    pdf_page_height: float,
+    region: DiagramRegion,
 ) -> int:
-    image_array = np.frombuffer(page_png_bytes, dtype=np.uint8)
-    page_image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-
-    if page_image is None:
+    if region.storage_key is None:
         return 0
 
-    page_height_px, page_width_px = page_image.shape[:2]
-
-    gray = cv2.cvtColor(page_image, cv2.COLOR_BGR2GRAY)
-
-    # Furniture manuals are usually black line drawings on white background.
-    # We invert threshold so dark lines/text become white foreground.
-    _, threshold = cv2.threshold(
-        gray,
-        245,
-        255,
-        cv2.THRESH_BINARY_INV,
+    metadata = dict(region.metadata)
+    metadata.update(
+        {
+            "region_id": region.region_id,
+            "region_type": region.region_type,
+            "parent_region_id": region.parent_region_id,
+            "step_number": region.step_number,
+            "part_number": region.part_number,
+            "quantity": region.quantity,
+            "nearby_text_tokens": region.nearby_text_tokens,
+            "warning_flag": region.warning_flag,
+            "bbox_px": region.bbox_px,
+            "pixel_bbox": region.bbox_px,
+            "padding": region.metadata.get("padding"),
+            "extractor_version": metadata.get(
+                "extractor_version",
+                OpenCVExtractor.extractor_version,
+            ),
+        }
     )
 
-    # Morphological closing connects nearby lines into larger diagram regions.
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
-    closed = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    contours, _ = cv2.findContours(
-        closed,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE,
+    evidence = SourceEvidence(
+        tenant_id=document.tenant_id,
+        document_id=document.id,
+        document_page_id=document_page.id,
+        evidence_type="diagram_region",
+        page_number=region.page_number,
+        x=_decimal(float(region.bbox_pdf["x"])),
+        y=_decimal(float(region.bbox_pdf["y"])),
+        width=_decimal(float(region.bbox_pdf["width"])),
+        height=_decimal(float(region.bbox_pdf["height"])),
+        coordinate_system="pdf_points_top_left",
+        storage_key=region.storage_key,
+        confidence=Decimal(str(round(region.confidence, 4))),
+        validation_flag="needs_review",
+        metadata_json=metadata,
     )
 
-    candidate_boxes: list[tuple[int, int, int, int]] = []
+    db.add(evidence)
+    return 1
 
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
 
-        if _is_probable_diagram_region(
-            x=x,
-            y=y,
-            w=w,
-            h=h,
-            page_width_px=page_width_px,
-            page_height_px=page_height_px,
-        ):
-            candidate_boxes.append((x, y, w, h))
-
-    boxes = _merge_overlapping_boxes(candidate_boxes)
-
+def _persist_diagram_regions(
+    *,
+    db: Session,
+    document: Document,
+    pages_by_number: dict[int, DocumentPage],
+    page_results: dict[int, DiagramExtractionResult],
+) -> int:
     diagram_count = 0
 
-    scale_x = pdf_page_width / page_width_px
-    scale_y = pdf_page_height / page_height_px
-
-    for diagram_index, (x, y, w, h) in enumerate(boxes):
-        padding = 20
-
-        crop_x1 = max(x - padding, 0)
-        crop_y1 = max(y - padding, 0)
-        crop_x2 = min(x + w + padding, page_width_px)
-        crop_y2 = min(y + h + padding, page_height_px)
-
-        crop = page_image[crop_y1:crop_y2, crop_x1:crop_x2]
-
-        success, encoded = cv2.imencode(".png", crop)
-
-        if not success:
-            continue
-
-        diagram_id = uuid.uuid4()
-
-        storage_key = storage_service.build_generated_key(
-            "documents",
-            str(document.id),
-            "diagrams",
-            f"page_{page_number}_diagram_{diagram_index}_{diagram_id}.png",
-        )
-
-        storage_service.write_bytes(storage_key, encoded.tobytes())
-
-        pdf_x = crop_x1 * scale_x
-        pdf_y = crop_y1 * scale_y
-        pdf_w = (crop_x2 - crop_x1) * scale_x
-        pdf_h = (crop_y2 - crop_y1) * scale_y
-
-        evidence = SourceEvidence(
-            tenant_id=document.tenant_id,
-            document_id=document.id,
-            document_page_id=document_page.id,
-            evidence_type="diagram_region",
-            page_number=page_number,
-            x=_decimal(pdf_x),
-            y=_decimal(pdf_y),
-            width=_decimal(pdf_w),
-            height=_decimal(pdf_h),
-            coordinate_system="pdf_points_top_left",
-            storage_key=storage_key,
-            confidence=Decimal("0.7000"),
-            validation_flag="needs_review",
-            metadata_json={
-                "source": "opencv_contour_crop_from_rendered_page",
-                "pixel_bbox": {
-                    "x": crop_x1,
-                    "y": crop_y1,
-                    "width": crop_x2 - crop_x1,
-                    "height": crop_y2 - crop_y1,
-                },
-                "rendered_page_width_px": page_width_px,
-                "rendered_page_height_px": page_height_px,
-            },
-        )
-
-        db.add(evidence)
-        diagram_count += 1
+    for page_number in sorted(page_results):
+        document_page = pages_by_number[page_number]
+        for region in page_results[page_number].regions:
+            diagram_count += _create_diagram_region_evidence(
+                db=db,
+                document=document,
+                document_page=document_page,
+                region=region,
+            )
 
     return diagram_count
 
@@ -409,6 +287,9 @@ def ingest_pdf_document(db: Session, document_id: uuid.UUID) -> IngestResult:
     embedded_image_count = 0
     diagram_region_count = 0
     pages_without_text = 0
+    page_inputs: list[PageExtractionInput] = []
+    pages_by_number: dict[int, DocumentPage] = {}
+    diagram_extractor = OpenCVExtractor()
 
     with fitz.open(pdf_path) as pdf_document:
         document.page_count = pdf_document.page_count
@@ -440,6 +321,15 @@ def ingest_pdf_document(db: Session, document_id: uuid.UUID) -> IngestResult:
 
             db.add(document_page)
             db.flush()
+            pages_by_number[page_number] = document_page
+            page_inputs.append(
+                PageExtractionInput(
+                    page_number=page_number,
+                    page_png_bytes=page_png,
+                    pdf_page_width=float(rect.width),
+                    pdf_page_height=float(rect.height),
+                )
+            )
 
             page_span_count = _extract_text_blocks(
                 db=db,
@@ -463,15 +353,25 @@ def ingest_pdf_document(db: Session, document_id: uuid.UUID) -> IngestResult:
                 page_number=page_number,
             )
 
-            diagram_region_count += _detect_and_crop_diagram_regions(
-                db=db,
-                document=document,
-                document_page=document_page,
-                page_number=page_number,
-                page_png_bytes=page_png,
-                pdf_page_width=float(rect.width),
-                pdf_page_height=float(rect.height),
-            )
+        diagram_storage_prefix = storage_service.build_generated_key(
+            "documents",
+            str(document.id),
+            "diagrams",
+        )
+        diagram_results = diagram_extractor.extract_document_regions(
+            page_inputs=page_inputs,
+            storage_prefix=diagram_storage_prefix,
+        )
+        diagram_extractor.write_warnings_json(
+            page_results=diagram_results,
+            storage_prefix=diagram_storage_prefix,
+        )
+        diagram_region_count = _persist_diagram_regions(
+            db=db,
+            document=document,
+            pages_by_number=pages_by_number,
+            page_results=diagram_results,
+        )
 
         document.scanned_flag = pages_without_text > 0
         document.detected_language = "en"
