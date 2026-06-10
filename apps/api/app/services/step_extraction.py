@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from uuid import UUID
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -12,6 +13,9 @@ from app.models.source_evidence import SourceEvidence
 from app.models.step import Step
 from app.models.step_source_evidence import StepSourceEvidence
 from app.models.task import Task
+from app.core.config import settings
+from app.services.claude_manual_extractor import ClaudeManualExtractor
+from app.services.llm_step_persistence import persist_llm_extraction_result
 
 
 STEP_PATTERN = re.compile(
@@ -226,3 +230,36 @@ def extract_steps_for_job(db: Session, job_id: uuid.UUID) -> StepExtractionResul
         step_count=step_count,
         task_count=task_count,
     )
+
+
+def extract_steps_for_job_with_provider(db: Session, job_id: UUID) -> int:
+    job = db.query(Job).filter(Job.id == job_id).first()
+
+    if not job:
+        raise ValueError(f"Job not found: {job_id}")
+
+    provider = settings.llm_extractor_provider.strip().lower()
+
+    if provider in {"claude", "anthropic"} and settings.anthropic_api_key:
+        extractor = ClaudeManualExtractor()
+
+        extraction_result = extractor.extract_document(
+            db=db,
+            document_id=job.document_id,
+            job_id=job.id,
+        )
+
+        extraction_method = (
+            "claude_fallback_v1"
+            if extraction_result.fallback_used
+            else "claude_primary_v1"
+        )
+
+        return persist_llm_extraction_result(
+            db=db,
+            job_id=job.id,
+            extraction_result=extraction_result,
+            extraction_method=extraction_method,
+        )
+
+    return extract_steps_for_job(db=db, job_id=job_id)

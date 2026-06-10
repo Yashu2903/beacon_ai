@@ -5,7 +5,7 @@ from app.models.enums import JobState
 from app.models.job import Job
 from app.services.job_state import transition_job_state
 from app.services.pdf_ingest import ingest_pdf_document
-from app.services.step_extraction import extract_steps_for_job
+from app.services.step_extraction import extract_steps_for_job_with_provider
 from worker.celery_app import celery_app
 
 
@@ -49,12 +49,19 @@ def ingest_manual(job_id: str):
 
         document = job.document
 
-        if ingest_result.text_span_count < MIN_TEXT_SPANS_FOR_EXTRACTION:
-            document.suitability_status = "needs_attention_low_text"
+        has_too_little_text = (
+            ingest_result.text_span_count < MIN_TEXT_SPANS_FOR_EXTRACTION
+        )
+        has_visual_evidence = (
+            ingest_result.diagram_region_count > 0 or ingest_result.page_count > 0
+        )
+
+        if has_too_little_text and not has_visual_evidence:
+            document.suitability_status = "needs_attention_low_evidence"
             job.failure_reason = (
-                "Very little extractable text was found. "
-                "This may be a scanned PDF or unsupported layout. "
-                "OCR fallback is needed before step extraction."
+                "Very little usable evidence was found. "
+                "The PDF may be scanned, corrupted, or unsupported. "
+                "Step extraction cannot continue without text or visual evidence."
             )
             db.commit()
 
@@ -64,9 +71,10 @@ def ingest_manual(job_id: str):
                 to_state=JobState.NEEDS_ATTENTION,
                 actor_type="worker",
                 message=(
-                    "Source evidence extraction found too little text. "
+                    "Source evidence extraction found too little usable evidence. "
                     f"text_spans={ingest_result.text_span_count}, "
                     f"diagram_regions={ingest_result.diagram_region_count}, "
+                    f"pages={ingest_result.page_count}, "
                     f"scanned_flag={ingest_result.scanned_flag}"
                 ),
             )
@@ -86,18 +94,19 @@ def ingest_manual(job_id: str):
                 f"text_spans={ingest_result.text_span_count}, "
                 f"embedded_images={ingest_result.embedded_image_count}, "
                 f"diagram_regions={ingest_result.diagram_region_count}, "
-                f"scanned_flag={ingest_result.scanned_flag}"
+                f"scanned_flag={ingest_result.scanned_flag}. "
+                "Starting provider-based step extraction."
             ),
         )
 
-        extraction_result = extract_steps_for_job(db, parsed_job_id)
+        step_count = extract_steps_for_job_with_provider(db, parsed_job_id)
 
-        if extraction_result.step_count == 0:
+        if step_count == 0:
             job = db.get(Job, parsed_job_id)
             if job:
                 job.failure_reason = (
-                    "No numbered assembly steps were detected. "
-                    "Manual may need OCR, better parsing, or LLM extraction."
+                    "No assembly steps were extracted from the manual evidence. "
+                    "Manual may need better OCR, better diagram parsing, or LLM review."
                 )
                 db.commit()
 
@@ -117,8 +126,7 @@ def ingest_manual(job_id: str):
             actor_type="worker",
             message=(
                 "Step extraction complete. "
-                f"steps={extraction_result.step_count}, "
-                f"tasks={extraction_result.task_count}. "
+                f"steps={step_count}. "
                 "Awaiting Gate 1 review."
             ),
         )
