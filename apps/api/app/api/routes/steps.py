@@ -2,7 +2,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
-
+from app.services.extraction_validation import validate_extracted_steps_for_job
 from app.core.database import get_db
 from app.models.enums import JobState
 from app.models.job import Job
@@ -295,3 +295,16 @@ def approve_gate_1(
         "state": JobState.STORYBOARDING.value,
         "message": "Gate 1 approved. Job moved to storyboarding.",
     }
+
+
+@router.get("/jobs/{job_id}/extraction-validation")
+def get_extraction_validation(
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    job = db.get(Job, job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return validate_extracted_steps_for_job(db=db, job_id=job_id)
