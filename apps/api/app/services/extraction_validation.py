@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.models.job import Job
 from app.models.step import Step
 from app.models.source_evidence import SourceEvidence
+from app.models.manual_page_structure import ManualPageStructure, ManualPageType
 from app.schemas.extraction_validation import (
     DocumentStepStructure,
     ExtractionValidationResult,
@@ -30,7 +31,7 @@ IGNORED_REGION_TYPES = {
     "safety",
 }
 
-
+MIN_VISIBLE_STEP_COVERAGE_FOR_VISIBLE_CHECK = 0.45
 MIN_VISIBLE_STEP_COVERAGE_FOR_UNEXPECTED_CHECK = 0.60
 
 
@@ -58,25 +59,49 @@ def _is_trusted_step_region(metadata: dict) -> bool:
         return False
 
     if region_type is None:
-        # Older extractor versions may not populate region_type.
         return True
 
     return region_type in TRUSTED_STEP_REGION_TYPES
 
 
-def get_visible_step_numbers_by_page(
+def _get_manual_page_structures_by_page(
+    db: Session,
+    document_id: UUID,
+) -> dict[int, ManualPageStructure]:
+    rows = (
+        db.query(ManualPageStructure)
+        .filter(ManualPageStructure.document_id == document_id)
+        .order_by(ManualPageStructure.page_number.asc())
+        .all()
+    )
+
+    return {row.page_number: row for row in rows}
+
+
+def _get_visible_step_numbers_from_manual_structure(
+    structures_by_page: dict[int, ManualPageStructure],
+) -> dict[int, list[int]]:
+    visible_by_page: dict[int, list[int]] = {}
+
+    for page_number, structure in structures_by_page.items():
+        numbers: list[int] = []
+
+        for value in structure.visible_step_numbers or []:
+            number = _coerce_step_number(value)
+
+            if number is not None:
+                numbers.append(number)
+
+        if numbers:
+            visible_by_page[page_number] = sorted(set(numbers))
+
+    return visible_by_page
+
+
+def _get_visible_step_numbers_from_diagram_metadata(
     db: Session,
     document_id: UUID,
 ) -> dict[int, list[int]]:
-    """
-    Return trusted visible manual step numbers by page.
-
-    This intentionally does NOT scan every text span for numbers because that
-    creates false positives from part numbers, quantities, page numbers, dates,
-    and document IDs.
-
-    It only trusts diagram_region metadata step_number values.
-    """
     evidence_rows = (
         db.query(SourceEvidence)
         .filter(SourceEvidence.document_id == document_id)
@@ -104,6 +129,38 @@ def get_visible_step_numbers_by_page(
     }
 
 
+def get_visible_step_numbers_by_page(
+    db: Session,
+    document_id: UUID,
+) -> dict[int, list[int]]:
+    """
+    Primary source:
+    - ManualPageStructure.visible_step_numbers
+
+    Fallback:
+    - diagram_region.metadata_json.step_number
+
+    We intentionally do not scan all text spans because that created false
+    positives from quantities, dates, page numbers, and part numbers.
+    """
+    structures_by_page = _get_manual_page_structures_by_page(
+        db=db,
+        document_id=document_id,
+    )
+
+    visible_from_structure = _get_visible_step_numbers_from_manual_structure(
+        structures_by_page=structures_by_page,
+    )
+
+    if visible_from_structure:
+        return visible_from_structure
+
+    return _get_visible_step_numbers_from_diagram_metadata(
+        db=db,
+        document_id=document_id,
+    )
+
+
 def _get_step_ids_by_number(steps: list[Step]) -> dict[int, list[str]]:
     step_ids_by_number: dict[int, list[str]] = defaultdict(list)
 
@@ -129,12 +186,6 @@ def _visible_step_coverage(
     visible_numbers: set[int],
     extracted_numbers: set[int],
 ) -> float:
-    """
-    Estimate whether visible-step metadata is complete enough to compare against.
-
-    If visible_numbers is empty or covers only a small fraction of extracted steps,
-    we should not generate unexpected_step_number warnings for every extracted step.
-    """
     if not extracted_numbers:
         return 0.0
 
@@ -146,20 +197,11 @@ def _visible_step_coverage(
     return matched / len(extracted_numbers)
 
 
-def _compute_sequence_gaps(extracted_numbers: list[int]) -> list[int]:
-    """
-    Detect missing numbers inside the extracted step sequence.
-
-    Example:
-    [1,2,3,4,5,6,7,9,10] -> missing [8]
-
-    This does not rely on OCR or diagram metadata.
-    It is useful when visible step detection is incomplete.
-    """
-    if not extracted_numbers:
+def _compute_sequence_gaps(numbers: list[int]) -> list[int]:
+    if not numbers:
         return []
 
-    unique_numbers = sorted(set(extracted_numbers))
+    unique_numbers = sorted(set(numbers))
 
     if len(unique_numbers) < 3:
         return []
@@ -173,12 +215,33 @@ def _compute_sequence_gaps(extracted_numbers: list[int]) -> list[int]:
     return sorted(expected - actual)
 
 
+def _get_step_page_type(
+    step: Step,
+    structures_by_page: dict[int, ManualPageStructure],
+) -> ManualPageType | None:
+    if step.source_page_number is None:
+        return None
+
+    structure = structures_by_page.get(step.source_page_number)
+
+    if structure is None:
+        return None
+
+    return structure.page_type
+
+
+def _is_assembly_page_type(page_type: ManualPageType | None) -> bool:
+    return page_type in {
+        ManualPageType.assembly_step,
+        ManualPageType.mixed_inventory_and_step,
+    }
+
+
 def _build_duplicate_step_issues(
     steps: list[Step],
     duplicate_numbers: list[int],
 ) -> list[StepValidationIssue]:
     issues: list[StepValidationIssue] = []
-
     step_ids_by_number = _get_step_ids_by_number(steps)
 
     for number in duplicate_numbers:
@@ -198,9 +261,7 @@ def _build_duplicate_step_issues(
                 severity="error",
                 page_number=related_pages[0] if related_pages else None,
                 step_number=number,
-                message=(
-                    f"Step number {number} appears multiple times in extracted steps."
-                ),
+                message=f"Step number {number} appears multiple times in extracted steps.",
                 suggested_action=(
                     "Merge duplicate entries if they describe one visible manual step, "
                     "or mark the incorrect duplicate as rejected/needs_attention."
@@ -216,9 +277,200 @@ def _build_duplicate_step_issues(
     return issues
 
 
+def _build_manual_structure_quality_issues(
+    structures_by_page: dict[int, ManualPageStructure],
+    visible_by_page: dict[int, list[int]],
+) -> tuple[list[StepValidationIssue], bool]:
+    """
+    Validate the manual structure detector itself.
+
+    Returns:
+    - issues
+    - structure_is_suspicious
+
+    If structure is suspicious, we still use it for missing-visible checks,
+    but suppress broad unexpected-step checks to avoid false positives.
+    """
+    issues: list[StepValidationIssue] = []
+    structure_is_suspicious = False
+
+    if not structures_by_page:
+        issues.append(
+            StepValidationIssue(
+                issue_type="manual_structure_missing",
+                severity="warning",
+                page_number=None,
+                step_number=None,
+                message="No ManualPageStructure rows found for this document.",
+                suggested_action=(
+                    "Run POST /documents/{document_id}/structure/detect before validation."
+                ),
+                related_step_ids=[],
+                metadata={},
+            )
+        )
+
+        return issues, True
+
+    visible_occurrences: dict[int, list[int]] = defaultdict(list)
+
+    for page_number, numbers in visible_by_page.items():
+        for number in numbers:
+            visible_occurrences[number].append(page_number)
+
+    duplicate_visible_numbers = sorted(
+        number
+        for number, pages in visible_occurrences.items()
+        if len(pages) > 1
+    )
+
+    for number in duplicate_visible_numbers:
+        structure_is_suspicious = True
+
+        issues.append(
+            StepValidationIssue(
+                issue_type="duplicate_visible_step_number",
+                severity="warning",
+                page_number=visible_occurrences[number][0],
+                step_number=number,
+                message=f"Manual structure detected visible step {number} on multiple pages.",
+                suggested_action=(
+                    "Inspect the detected page structure. This may indicate OCR drift "
+                    "or an incorrect repaired visible step."
+                ),
+                related_step_ids=[],
+                metadata={
+                    "candidate_pages": visible_occurrences[number],
+                },
+            )
+        )
+
+    visible_numbers = sorted(
+        {
+            number
+            for numbers in visible_by_page.values()
+            for number in numbers
+        }
+    )
+
+    if visible_numbers:
+        min_visible = min(visible_numbers)
+
+        if min_visible != 1:
+            structure_is_suspicious = True
+
+            issues.append(
+                StepValidationIssue(
+                    issue_type="manual_structure_missing_start_step",
+                    severity="warning",
+                    page_number=None,
+                    step_number=1,
+                    message=f"Manual structure starts at visible step {min_visible}, not step 1.",
+                    suggested_action=(
+                        "Inspect early assembly pages. The detector may have missed "
+                        "the first visible steps or misread a diagram artifact."
+                    ),
+                    related_step_ids=[],
+                    metadata={
+                        "min_visible_step": min_visible,
+                        "visible_step_numbers": visible_numbers,
+                    },
+                )
+            )
+
+        manual_sequence_gaps = _compute_sequence_gaps(visible_numbers)
+
+        for missing_number in manual_sequence_gaps:
+            structure_is_suspicious = True
+
+            candidate_pages = _get_pages_for_visible_number(
+                visible_by_page=visible_by_page,
+                step_number=missing_number - 1,
+            ) + _get_pages_for_visible_number(
+                visible_by_page=visible_by_page,
+                step_number=missing_number + 1,
+            )
+
+            issues.append(
+                StepValidationIssue(
+                    issue_type="manual_structure_sequence_gap",
+                    severity="warning",
+                    page_number=candidate_pages[0] if candidate_pages else None,
+                    step_number=missing_number,
+                    message=(
+                        f"Manual structure visible-step sequence appears to skip "
+                        f"step {missing_number}."
+                    ),
+                    suggested_action=(
+                        "Inspect nearby pages. This may be a real missing structure "
+                        "detection or a page/step repair drift."
+                    ),
+                    related_step_ids=[],
+                    metadata={
+                        "candidate_pages": sorted(set(candidate_pages)),
+                        "visible_step_numbers": visible_numbers,
+                    },
+                )
+            )
+
+    for structure in structures_by_page.values():
+        metadata = structure.metadata_json or {}
+
+        if metadata.get("repair_applied") is True:
+            issues.append(
+                StepValidationIssue(
+                    issue_type="manual_structure_repaired_page",
+                    severity="info",
+                    page_number=structure.page_number,
+                    step_number=None,
+                    message=(
+                        f"Manual structure for page {structure.page_number} includes "
+                        "heuristically repaired step numbers."
+                    ),
+                    suggested_action=(
+                        "Use this page as a helpful signal, but keep confidence lower "
+                        "than directly OCR-detected step numbers."
+                    ),
+                    related_step_ids=[],
+                    metadata={
+                        "visible_step_numbers": structure.visible_step_numbers,
+                        "confidence": structure.confidence,
+                        "repair_types": metadata.get("repair_types", []),
+                        "repair_notes": metadata.get("repair_notes", []),
+                    },
+                )
+            )
+
+        if float(structure.confidence or 0.0) < 0.65 and structure.visible_step_numbers:
+            issues.append(
+                StepValidationIssue(
+                    issue_type="manual_structure_low_confidence_visible_step",
+                    severity="warning",
+                    page_number=structure.page_number,
+                    step_number=None,
+                    message=(
+                        f"Manual structure detected visible steps on page "
+                        f"{structure.page_number}, but confidence is low."
+                    ),
+                    suggested_action=(
+                        "Review this page before using it as strong validation evidence."
+                    ),
+                    related_step_ids=[],
+                    metadata={
+                        "visible_step_numbers": structure.visible_step_numbers,
+                        "confidence": structure.confidence,
+                    },
+                )
+            )
+
+    return issues, structure_is_suspicious
+
+
 def _build_missing_visible_step_issues(
     visible_by_page: dict[int, list[int]],
     missing_visible_numbers: list[int],
+    structures_by_page: dict[int, ManualPageStructure],
+    structure_is_suspicious: bool,
 ) -> list[StepValidationIssue]:
     issues: list[StepValidationIssue] = []
 
@@ -228,22 +480,43 @@ def _build_missing_visible_step_issues(
             step_number=number,
         )
 
+        confidences = []
+        page_types = []
+
+        for page in candidate_pages:
+            structure = structures_by_page.get(page)
+
+            if structure is not None:
+                confidences.append(float(structure.confidence or 0.0))
+                page_types.append(str(structure.page_type.value))
+
+        severity = "warning" if structure_is_suspicious else "error"
+
+        # If the page has good confidence, still treat it as error even if
+        # another part of the structure is suspicious.
+        if confidences and max(confidences) >= 0.70:
+            severity = "error"
+
         issues.append(
             StepValidationIssue(
                 issue_type="missing_visible_step",
-                severity="error",
+                severity=severity,
                 page_number=candidate_pages[0] if candidate_pages else None,
                 step_number=number,
                 message=(
-                    f"Trusted visible manual step {number} appears in diagram evidence, "
+                    f"Manual structure detected visible step {number}, "
                     "but no extracted step has this step number."
                 ),
                 suggested_action=(
-                    "Re-run extraction for the candidate page or manually create the missing step."
+                    "Re-run extraction for the candidate page or manually create "
+                    "the missing step if the visible step is real."
                 ),
                 related_step_ids=[],
                 metadata={
                     "candidate_pages": candidate_pages,
+                    "structure_confidences": confidences,
+                    "page_types": page_types,
+                    "structure_is_suspicious": structure_is_suspicious,
                 },
             )
         )
@@ -251,12 +524,55 @@ def _build_missing_visible_step_issues(
     return issues
 
 
+def _filter_unexpected_numbers(
+    steps: list[Step],
+    unexpected_numbers: list[int],
+    structures_by_page: dict[int, ManualPageStructure],
+    max_visible_number: int | None,
+) -> list[int]:
+    """
+    Remove acceptable unexpected numbers before reporting.
+
+    Example:
+    Manual structure detected visible steps only up to 11, but extracted step 12
+    comes from an assembly page. This may mean structure detection missed the
+    final visible number on that same assembly page, so we should not report it
+    as unexpected.
+
+    But if step 14 or 15 comes from an informational page, keep it unexpected.
+    """
+    filtered: list[int] = []
+
+    for number in unexpected_numbers:
+        related_steps = [
+            step
+            for step in steps
+            if step.step_number == number
+        ]
+
+        should_suppress = False
+
+        if max_visible_number is not None and number == max_visible_number + 1:
+            if related_steps and all(
+                _is_assembly_page_type(
+                    _get_step_page_type(step, structures_by_page)
+                )
+                for step in related_steps
+            ):
+                should_suppress = True
+
+        if not should_suppress:
+            filtered.append(number)
+
+    return filtered
+
+
 def _build_unexpected_step_issues(
     steps: list[Step],
     unexpected_numbers: list[int],
+    structures_by_page: dict[int, ManualPageStructure],
 ) -> list[StepValidationIssue]:
     issues: list[StepValidationIssue] = []
-
     step_ids_by_number = _get_step_ids_by_number(steps)
 
     for number in unexpected_numbers:
@@ -276,6 +592,17 @@ def _build_unexpected_step_issues(
             }
         )
 
+        page_types = []
+
+        for step in related_steps:
+            page_type = _get_step_page_type(
+                step=step,
+                structures_by_page=structures_by_page,
+            )
+
+            if page_type is not None:
+                page_types.append(str(page_type.value))
+
         issues.append(
             StepValidationIssue(
                 issue_type="unexpected_step_number",
@@ -283,8 +610,8 @@ def _build_unexpected_step_issues(
                 page_number=related_pages[0] if related_pages else None,
                 step_number=number,
                 message=(
-                    f"Extracted step number {number} was not found among trusted "
-                    "visible step numbers from diagram evidence."
+                    f"Extracted step number {number} was not found among "
+                    "manual-structure visible step numbers."
                 ),
                 suggested_action=(
                     "Verify this is not an informational, inventory, or variant page "
@@ -293,6 +620,7 @@ def _build_unexpected_step_issues(
                 related_step_ids=related_step_ids,
                 metadata={
                     "candidate_pages": related_pages,
+                    "page_types": page_types,
                 },
             )
         )
@@ -304,12 +632,6 @@ def _build_sequence_gap_issues(
     steps: list[Step],
     sequence_gaps: list[int],
 ) -> list[StepValidationIssue]:
-    """
-    Flag missing numbers inside the extracted sequence.
-
-    This is a warning, not an error, because some manuals contain informational
-    or variant pages that may make the visible sequence non-obvious.
-    """
     issues: list[StepValidationIssue] = []
 
     if not sequence_gaps:
@@ -344,8 +666,7 @@ def _build_sequence_gap_issues(
                 ),
                 suggested_action=(
                     "Check nearby source pages. If the manual has a real visible step "
-                    "with this number, re-run extraction or create it manually. If this "
-                    "is an informational/variant page, mark the warning as reviewed."
+                    "with this number, re-run extraction or create it manually."
                 ),
                 related_step_ids=[],
                 metadata={
@@ -362,18 +683,15 @@ def _build_visible_detection_quality_issue(
     visible_numbers: set[int],
     extracted_numbers: set[int],
     coverage: float,
+    used_manual_structure: bool,
 ) -> list[StepValidationIssue]:
-    """
-    Add one diagnostic warning when visible step detection coverage is poor.
-
-    This prevents the API from spamming every extracted step as unexpected just
-    because the OCR/diagram metadata did not capture step numbers reliably.
-    """
     if not extracted_numbers:
         return []
 
     if coverage >= MIN_VISIBLE_STEP_COVERAGE_FOR_UNEXPECTED_CHECK:
         return []
+
+    source = "ManualPageStructure" if used_manual_structure else "diagram metadata"
 
     return [
         StepValidationIssue(
@@ -382,12 +700,12 @@ def _build_visible_detection_quality_issue(
             page_number=None,
             step_number=None,
             message=(
-                "Trusted visible-step detection coverage is low. "
+                f"Trusted visible-step detection coverage is low using {source}. "
                 "Skipping broad unexpected-step validation to avoid false positives."
             ),
             suggested_action=(
-                "Improve diagram/OCR step-number metadata extraction, or review "
-                "sequence-gap and duplicate-step warnings manually."
+                "Improve manual structure detection or review sequence-gap and "
+                "duplicate-step warnings manually."
             ),
             related_step_ids=[],
             metadata={
@@ -395,9 +713,71 @@ def _build_visible_detection_quality_issue(
                 "extracted_step_numbers": sorted(extracted_numbers),
                 "coverage": coverage,
                 "threshold": MIN_VISIBLE_STEP_COVERAGE_FOR_UNEXPECTED_CHECK,
+                "source": source,
             },
         )
     ]
+
+
+def _build_step_on_non_assembly_page_issues(
+    steps: list[Step],
+    structures_by_page: dict[int, ManualPageStructure],
+) -> list[StepValidationIssue]:
+    issues: list[StepValidationIssue] = []
+
+    non_assembly_types = {
+        ManualPageType.cover,
+        ManualPageType.parts_inventory,
+        ManualPageType.informational,
+        ManualPageType.back_matter,
+    }
+
+    for step in steps:
+        if step.source_page_number is None:
+            continue
+
+        structure = structures_by_page.get(step.source_page_number)
+
+        if structure is None:
+            continue
+
+        if structure.page_type not in non_assembly_types:
+            continue
+
+        severity = "warning"
+
+        if structure.page_type in {
+            ManualPageType.cover,
+            ManualPageType.back_matter,
+            ManualPageType.parts_inventory,
+        }:
+            severity = "error"
+
+        issues.append(
+            StepValidationIssue(
+                issue_type="step_on_non_assembly_page",
+                severity=severity,
+                page_number=step.source_page_number,
+                step_number=step.step_number,
+                message=(
+                    f"Extracted step {step.step_number} comes from page "
+                    f"{step.source_page_number}, which manual structure classifies "
+                    f"as {structure.page_type.value}."
+                ),
+                suggested_action=(
+                    "Verify this step. It may be an informational/variant page "
+                    "incorrectly converted into a numbered assembly step."
+                ),
+                related_step_ids=[str(step.id)],
+                metadata={
+                    "page_type": structure.page_type.value,
+                    "visible_step_numbers_on_page": structure.visible_step_numbers,
+                    "structure_confidence": structure.confidence,
+                },
+            )
+        )
+
+    return issues
 
 
 def _build_quality_issues(steps: list[Step]) -> list[StepValidationIssue]:
@@ -413,9 +793,7 @@ def _build_quality_issues(steps: list[Step]) -> list[StepValidationIssue]:
                     severity="warning",
                     page_number=step.source_page_number,
                     step_number=step.step_number,
-                    message=(
-                        f"Step {step.step_number} has low confidence {confidence:.2f}."
-                    ),
+                    message=f"Step {step.step_number} has low confidence {confidence:.2f}.",
                     suggested_action="Review this step manually before storyboarding.",
                     related_step_ids=[str(step.id)],
                     metadata={
@@ -459,17 +837,6 @@ def validate_extracted_steps_for_job(
     db: Session,
     job_id: UUID,
 ) -> ExtractionValidationResult:
-    """
-    Validate extracted LLM/heuristic steps against manual structure signals.
-
-    This does not call an LLM.
-    This does not mutate the database.
-    This only returns validation issues for review/debugging.
-
-    Important:
-    If trusted visible-step metadata has poor coverage, broad unexpected-step
-    warnings are suppressed to avoid noisy false positives.
-    """
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
@@ -481,6 +848,13 @@ def validate_extracted_steps_for_job(
         .order_by(Step.order_index.asc())
         .all()
     )
+
+    structures_by_page = _get_manual_page_structures_by_page(
+        db=db,
+        document_id=job.document_id,
+    )
+
+    used_manual_structure = bool(structures_by_page)
 
     visible_by_page = get_visible_step_numbers_by_page(
         db=db,
@@ -517,16 +891,38 @@ def validate_extracted_steps_for_job(
         extracted_numbers=extracted_number_set,
     )
 
+    manual_structure_issues, structure_is_suspicious = (
+        _build_manual_structure_quality_issues(
+            structures_by_page=structures_by_page,
+            visible_by_page=visible_by_page,
+        )
+    )
+
     missing_visible_numbers: list[int] = []
     unexpected_numbers: list[int] = []
 
-    if coverage >= MIN_VISIBLE_STEP_COVERAGE_FOR_UNEXPECTED_CHECK:
+    if coverage >= MIN_VISIBLE_STEP_COVERAGE_FOR_VISIBLE_CHECK:
         missing_visible_numbers = sorted(
             visible_number_set - extracted_number_set
         )
 
-        unexpected_numbers = sorted(
+    max_visible_number = max(visible_number_set) if visible_number_set else None
+
+    # Only do broad unexpected-step validation when structure coverage is good
+    # and the structure itself does not look drifted.
+    if (
+        coverage >= MIN_VISIBLE_STEP_COVERAGE_FOR_UNEXPECTED_CHECK
+        and not structure_is_suspicious
+    ):
+        raw_unexpected_numbers = sorted(
             extracted_number_set - visible_number_set
+        )
+
+        unexpected_numbers = _filter_unexpected_numbers(
+            steps=steps,
+            unexpected_numbers=raw_unexpected_numbers,
+            structures_by_page=structures_by_page,
+            max_visible_number=max_visible_number,
         )
 
     sequence_gaps = _compute_sequence_gaps(extracted_numbers)
@@ -540,11 +936,14 @@ def validate_extracted_steps_for_job(
         )
     )
 
+    issues.extend(manual_structure_issues)
+
     issues.extend(
         _build_visible_detection_quality_issue(
             visible_numbers=visible_number_set,
             extracted_numbers=extracted_number_set,
             coverage=coverage,
+            used_manual_structure=used_manual_structure,
         )
     )
 
@@ -552,6 +951,8 @@ def validate_extracted_steps_for_job(
         _build_missing_visible_step_issues(
             visible_by_page=visible_by_page,
             missing_visible_numbers=missing_visible_numbers,
+            structures_by_page=structures_by_page,
+            structure_is_suspicious=structure_is_suspicious,
         )
     )
 
@@ -559,6 +960,7 @@ def validate_extracted_steps_for_job(
         _build_unexpected_step_issues(
             steps=steps,
             unexpected_numbers=unexpected_numbers,
+            structures_by_page=structures_by_page,
         )
     )
 
@@ -566,6 +968,13 @@ def validate_extracted_steps_for_job(
         _build_sequence_gap_issues(
             steps=steps,
             sequence_gaps=sequence_gaps,
+        )
+    )
+
+    issues.extend(
+        _build_step_on_non_assembly_page_issues(
+            steps=steps,
+            structures_by_page=structures_by_page,
         )
     )
 

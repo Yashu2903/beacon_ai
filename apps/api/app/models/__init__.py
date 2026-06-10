@@ -7,6 +7,7 @@ from app.models.source_evidence import SourceEvidence
 from app.models.step import Step
 from app.models.step_source_evidence import StepSourceEvidence
 from app.models.task import Task
+from app.models.manual_page_structure import ManualPageStructure, ManualPageType
 from app.models.user import User
 
 __all__ = [
@@ -20,4 +21,6 @@ __all__ = [
     "StepSourceEvidence",
     "Task",
     "User",
+    "ManualPageStructure",
+    "ManualPageType",
 ]

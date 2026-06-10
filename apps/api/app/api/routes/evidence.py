@@ -9,6 +9,11 @@ from app.models.document_page import DocumentPage
 from app.models.source_evidence import SourceEvidence
 from app.schemas.document import DocumentResponse
 from app.schemas.evidence import DocumentPageResponse, SourceEvidenceResponse
+from app.schemas.manual_page_structure import ManualPageStructureResponse
+from app.services.manual_structure import (
+    detect_manual_structure_for_document,
+    get_manual_structure_for_document,
+)
 
 router = APIRouter(prefix="/documents", tags=["evidence"])
 
@@ -79,3 +84,41 @@ def list_source_evidence(
     )
 
     return evidence
+
+
+@router.post(
+    "/{document_id}/structure/detect",
+    response_model=list[ManualPageStructureResponse],
+)
+def detect_document_structure(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return detect_manual_structure_for_document(
+        db=db,
+        document_id=document_id,
+    )
+
+
+@router.get(
+    "/{document_id}/structure",
+    response_model=list[ManualPageStructureResponse],
+)
+def get_document_structure(
+    document_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    document = db.get(Document, document_id)
+
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    return get_manual_structure_for_document(
+        db=db,
+        document_id=document_id,
+    )
