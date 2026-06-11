@@ -1,5 +1,7 @@
 from typing import Any, Literal
-from pydantic import BaseModel, Field
+from uuid import UUID
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class StepRepairProposedChange(BaseModel):
@@ -44,3 +46,14 @@ class StepRepairProposal(BaseModel):
 
     warnings: list[str] = Field(default_factory=list)
     raw_model_response: dict[str, Any] | None = None
+
+    @field_validator("job_id", "document_id", mode="before")
+    @classmethod
+    def _coerce_uuid_fields_to_string(cls, value: Any) -> str:
+        if isinstance(value, UUID):
+            return str(value)
+
+        if isinstance(value, str):
+            return value.strip()
+
+        return str(value).strip()

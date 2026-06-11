@@ -1,6 +1,9 @@
 import uuid
+from typing import Any
+
 from app.services.step_repair import build_or_apply_step_repair
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session, selectinload
 from app.services.extraction_validation import validate_extracted_steps_for_job
 from app.core.database import get_db
@@ -9,13 +12,15 @@ from app.models.job import Job
 from app.models.review_event import ReviewEvent
 from app.models.step import Step
 from app.models.task import Task
+from app.schemas.step_repair import StepRepairProposal
+from app.services.step_repair_apply import apply_step_repair_proposal
 from app.schemas.step import (
     Gate1ApproveRequest,
     StepReorderRequest,
     StepResponse,
     StepUpdateRequest,
 )
-from app.services.gate_1_validation import (
+from app.services.gate1_validation import (
     Gate1ApprovalError,
     approve_gate_1_or_raise,
     get_gate_1_blocking_issues,
@@ -42,6 +47,43 @@ def _serialize_step_before(step: Step) -> dict:
         "review_status": step.review_status,
         "reviewer_notes": step.reviewer_notes,
     }
+
+
+def _parse_step_repair_proposal_payload(payload: dict[str, Any]) -> StepRepairProposal:
+    if "llm_repair_packet" in payload:
+        raise ValueError(
+            "Invalid repair apply payload: received the repair planning response. "
+            "Call POST /jobs/{job_id}/steps/repair/propose and send that response body "
+            "to /jobs/{job_id}/steps/repair/apply."
+        )
+
+    if "response_schema" in payload:
+        raise ValueError(
+            "Invalid repair apply payload: received the response_schema template, "
+            "not an actual StepRepairProposal."
+        )
+
+    proposal_payload = payload.get("proposal", payload)
+
+    if not isinstance(proposal_payload, dict):
+        raise ValueError("Invalid repair apply payload: proposal body must be an object")
+
+    if proposal_payload.get("job_id") == "string":
+        raise ValueError(
+            "Invalid proposal job_id: received the literal schema placeholder 'string'. "
+            "Use the actual job_id from POST /jobs/{job_id}/steps/repair/propose."
+        )
+
+    if proposal_payload.get("document_id") == "string":
+        raise ValueError(
+            "Invalid proposal document_id: received the literal schema placeholder 'string'. "
+            "Use the actual document_id from POST /jobs/{job_id}/steps/repair/propose."
+        )
+
+    try:
+        return StepRepairProposal.model_validate(proposal_payload)
+    except ValidationError as exc:
+        raise ValueError(f"Invalid repair proposal payload: {exc}") from exc
 
 
 @router.get("/jobs/{job_id}/tasks", response_model=list[TaskResponse])
@@ -102,6 +144,25 @@ def repair_job_steps(
         job_id=job_id,
         apply_safe_fixes=apply_safe_fixes,
     )
+
+
+@router.post("/jobs/{job_id}/steps/repair/apply")
+def apply_job_step_repair(
+    job_id: uuid.UUID,
+    payload: dict[str, Any] = Body(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        proposal = _parse_step_repair_proposal_payload(payload)
+
+        return apply_step_repair_proposal(
+            db=db,
+            job_id=job_id,
+            proposal=proposal,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 
 @router.patch("/steps/{step_id}", response_model=StepResponse)
 def update_step(
