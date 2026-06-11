@@ -3,7 +3,9 @@ import uuid
 from app.core.database import SessionLocal
 from app.models.enums import JobState
 from app.models.job import Job
+from app.services.extraction_validation import validate_extracted_steps_for_job
 from app.services.job_state import transition_job_state
+from app.services.manual_structure import detect_manual_structure_for_document
 from app.services.pdf_ingest import ingest_pdf_document
 from app.services.step_extraction import extract_steps_for_job_with_provider
 from worker.celery_app import celery_app
@@ -83,6 +85,11 @@ def ingest_manual(job_id: str):
         document.suitability_status = "evidence_ready"
         db.commit()
 
+        manual_structure = detect_manual_structure_for_document(
+            db=db,
+            document_id=job.document_id,
+        )
+
         transition_job_state(
             db,
             job_id=parsed_job_id,
@@ -94,6 +101,7 @@ def ingest_manual(job_id: str):
                 f"text_spans={ingest_result.text_span_count}, "
                 f"embedded_images={ingest_result.embedded_image_count}, "
                 f"diagram_regions={ingest_result.diagram_region_count}, "
+                f"manual_structure_pages={len(manual_structure)}, "
                 f"scanned_flag={ingest_result.scanned_flag}. "
                 "Starting provider-based step extraction."
             ),
@@ -119,6 +127,11 @@ def ingest_manual(job_id: str):
             )
             return
 
+        validation = validate_extracted_steps_for_job(
+            db=db,
+            job_id=parsed_job_id,
+        )
+
         transition_job_state(
             db,
             job_id=parsed_job_id,
@@ -127,6 +140,7 @@ def ingest_manual(job_id: str):
             message=(
                 "Step extraction complete. "
                 f"steps={step_count}. "
+                f"validation_errors={validation.error_count}. "
                 "Awaiting Gate 1 review."
             ),
         )

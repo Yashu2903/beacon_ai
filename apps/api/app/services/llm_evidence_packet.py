@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.document_page import DocumentPage
 from app.models.source_evidence import SourceEvidence
-
+from app.services.manual_structure_prompt_context import build_manual_structure_prompt_context
 
 @dataclass
 class EvidenceItem:
@@ -36,6 +36,9 @@ class PageEvidencePacket:
             "page_number": self.page_number,
             "full_page_image_evidence_id": (
                 self.full_page_image.id if self.full_page_image else None
+            ),
+            "full_page_image_storage_key": (
+                self.full_page_image.storage_key if self.full_page_image else None
             ),
             "text_evidence": [
                 {
@@ -198,3 +201,36 @@ def build_page_evidence_packets(
         )
 
     return packets
+
+def build_llm_evidence_packet(
+    db: Session,
+    document_id: UUID,
+) -> dict:
+    """
+    Builds the full evidence packet for the LLM extractor.
+
+    This combines:
+    - page-level OCR / diagram / image evidence
+    - manual structure context from ManualPageStructure
+
+    The LLM should use manual_structure_context as the planning map before
+    extracting steps.
+    """
+    page_packets = build_page_evidence_packets(
+        db=db,
+        document_id=document_id,
+    )
+
+    manual_structure_context = build_manual_structure_prompt_context(
+        db=db,
+        document_id=document_id,
+    )
+
+    return {
+        "document_id": str(document_id),
+        "manual_structure_context": manual_structure_context,
+        "pages": [
+            packet.to_prompt_json()
+            for packet in page_packets
+        ],
+    }

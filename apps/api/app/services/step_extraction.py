@@ -9,6 +9,7 @@ from decimal import Decimal
 from sqlalchemy.orm import Session
 
 from app.models.job import Job
+from app.models.manual_page_structure import ManualPageStructure
 from app.models.source_evidence import SourceEvidence
 from app.models.step import Step
 from app.models.step_source_evidence import StepSourceEvidence
@@ -16,6 +17,7 @@ from app.models.task import Task
 from app.core.config import settings
 from app.services.claude_manual_extractor import ClaudeManualExtractor
 from app.services.llm_step_persistence import persist_llm_extraction_result
+from app.services.manual_structure import detect_manual_structure_for_document
 
 
 STEP_PATTERN = re.compile(
@@ -241,6 +243,18 @@ def extract_steps_for_job_with_provider(db: Session, job_id: UUID) -> int:
     provider = settings.llm_extractor_provider.strip().lower()
 
     if provider in {"claude", "anthropic"} and settings.anthropic_api_key:
+        existing_structure_count = (
+            db.query(ManualPageStructure)
+            .filter(ManualPageStructure.document_id == job.document_id)
+            .count()
+        )
+
+        if existing_structure_count == 0:
+            detect_manual_structure_for_document(
+                db=db,
+                document_id=job.document_id,
+            )
+
         extractor = ClaudeManualExtractor()
 
         extraction_result = extractor.extract_document(
