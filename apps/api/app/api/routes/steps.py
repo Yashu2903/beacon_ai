@@ -1,5 +1,5 @@
 import uuid
-
+from app.services.step_repair import build_or_apply_step_repair
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, selectinload
 from app.services.extraction_validation import validate_extracted_steps_for_job
@@ -15,8 +15,17 @@ from app.schemas.step import (
     StepResponse,
     StepUpdateRequest,
 )
+from app.services.gate_1_validation import (
+    Gate1ApprovalError,
+    approve_gate_1_or_raise,
+    get_gate_1_blocking_issues,
+)
 from app.schemas.task import TaskResponse
 from app.services.job_state import transition_job_state
+
+from app.services.claude_step_repair import propose_step_repair_with_claude
+
+
 
 router = APIRouter(tags=["gate-1-steps"])
 
@@ -52,6 +61,15 @@ def list_job_tasks(
         .all()
     )
 
+@router.post("/jobs/{job_id}/steps/repair/propose")
+def propose_job_step_repair(
+    job_id: uuid.UUID,
+    db: Session = Depends(get_db),
+):
+    return propose_step_repair_with_claude(
+        db=db,
+        job_id=job_id,
+    )
 
 @router.get("/jobs/{job_id}/steps", response_model=list[StepResponse])
 def list_job_steps(
@@ -73,6 +91,17 @@ def list_job_steps(
 
     return steps
 
+@router.post("/jobs/{job_id}/steps/repair")
+def repair_job_steps(
+    job_id: uuid.UUID,
+    apply_safe_fixes: bool = False,
+    db: Session = Depends(get_db),
+):
+    return build_or_apply_step_repair(
+        db=db,
+        job_id=job_id,
+        apply_safe_fixes=apply_safe_fixes,
+    )
 
 @router.patch("/steps/{step_id}", response_model=StepResponse)
 def update_step(
@@ -236,65 +265,32 @@ def reorder_steps(
 @router.post("/jobs/{job_id}/gate-1/approve")
 def approve_gate_1(
     job_id: uuid.UUID,
-    payload: Gate1ApproveRequest,
     db: Session = Depends(get_db),
 ):
-    job = db.get(Job, job_id)
-
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    if job.state != JobState.AWAITING_REVIEW_1:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Job must be awaiting_review_1, current state is {job.state.value}",
+    try:
+        validation = approve_gate_1_or_raise(
+            db=db,
+            job_id=job_id,
         )
 
-    steps = db.query(Step).filter(Step.job_id == job_id).all()
+        return {
+            "approved": True,
+            "message": "Gate 1 approved. Job moved to storyboarding.",
+            "blocking_issue_count": 0,
+            "blocking_issues": [],
+            "validation": validation,
+        }
 
-    if not steps:
-        raise HTTPException(status_code=400, detail="No steps found for this job")
+    except Gate1ApprovalError as error:
+        blocking_issues = get_gate_1_blocking_issues(error.validation)
 
-    unapproved = [
-        step.id
-        for step in steps
-        if step.review_status not in {"approved", "edited"}
-    ]
-
-    if unapproved:
-        raise HTTPException(
-            status_code=400,
-            detail="All steps must be approved or edited before Gate 1 approval.",
-        )
-
-    review_event = ReviewEvent(
-        tenant_id=job.tenant_id,
-        job_id=job.id,
-        gate_number=1,
-        target_type="job",
-        target_id=job.id,
-        action="approve_gate_1",
-        time_spent_seconds=payload.time_spent_seconds,
-        click_count=payload.click_count,
-        notes=payload.notes,
-    )
-
-    db.add(review_event)
-    db.commit()
-
-    transition_job_state(
-        db,
-        job_id=job.id,
-        to_state=JobState.STORYBOARDING,
-        actor_type="reviewer",
-        message="Gate 1 approved. Steps are ready for storyboard generation.",
-    )
-
-    return {
-        "job_id": str(job.id),
-        "state": JobState.STORYBOARDING.value,
-        "message": "Gate 1 approved. Job moved to storyboarding.",
-    }
+        return {
+            "approved": False,
+            "message": error.message,
+            "blocking_issue_count": len(blocking_issues),
+            "blocking_issues": blocking_issues,
+            "validation": error.validation,
+        }
 
 
 @router.get("/jobs/{job_id}/extraction-validation")

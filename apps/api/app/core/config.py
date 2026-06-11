@@ -25,10 +25,13 @@ class Settings(BaseSettings):
 
     claude_primary_model: str = "claude-sonnet-4-6"
     claude_fallback_model: str = "claude-opus-4-7"
+    claude_repair_model: str | None = None
 
     claude_max_tokens: int = 4096
     claude_temperature: float = 0.0
     claude_enable_fallback: bool = True
+    claude_repair_max_tokens: int = 4096
+    claude_repair_temperature: float = 0.0
 
     llm_min_step_confidence: float = 0.70
     max_diagram_images_per_page: int = 8
